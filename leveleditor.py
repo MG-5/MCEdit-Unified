@@ -11,6 +11,11 @@ ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
 WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
 ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE."""
+# Moving this here to get log entries ASAP -- D.C.-G.
+import logging
+from pymclevel.schematic import StructureNBT
+log = logging.getLogger(__name__)
+
 #-# Modified by D.C.-G. for translation purpose
 #.# Marks the layout modifications. -- D.C.-G.
 from editortools.thumbview import ThumbView 
@@ -25,6 +30,7 @@ from pymclevel import nbt
 from editortools.select import SelectionTool
 from pymclevel.box import BoundingBox
 from waypoints import WaypointManager
+from editortools.timeditor import TimeEditor
 
 """
 leveleditor.py
@@ -47,7 +53,6 @@ import numpy
 from config import config
 from config import DEF_ENC
 import frustum
-import logging
 import glutils
 import release
 import mceutils
@@ -70,12 +75,13 @@ from collections import defaultdict, deque
 from OpenGL import GL
 
 from albow import alert, ask, AttrRef, Button, Column, input_text, IntField, Row, \
-    TableColumn, TableView, TextFieldWrapped, TimeField, Widget, CheckBox
+    TableColumn, TableView, TextFieldWrapped, TimeField, Widget, CheckBox, \
+    unparented
 import albow.resource
 
 albow.resource.font_proportion = config.settings.fontProportion.get()
 get_font = albow.resource.get_font
-from albow.controls import Label, ValueDisplay, Image
+from albow.controls import Label, ValueDisplay, Image, RotatableImage
 from albow.dialogs import Dialog, QuickDialog, wrapped_label
 from albow.openglwidgets import GLOrtho, GLViewport
 from albow.translate import _
@@ -92,6 +98,8 @@ from renderer import MCRenderer
 from pymclevel.entity import Entity
 from pymclevel.infiniteworld import AnvilWorldFolder, SessionLockLost, MCAlphaDimension,\
     MCInfdevOldLevel
+# Block and item translation
+from mclangres import translate as trn
 
 try:
     import resource  # @UnresolvedImport
@@ -160,6 +168,10 @@ class LevelEditor(GLViewport):
 
         self.level = None
 
+        # Tracking the dimension changes.
+        self.prev_dimension = None
+        self.new_dimension = None
+
         self.cameraInputs = [0., 0., 0.]
         self.cameraPanKeys = [0., 0.]
         self.movements = [
@@ -215,45 +227,47 @@ class LevelEditor(GLViewport):
 
         def chooseDistance():
             self.changeViewDistance(int(self.viewDistanceReadout.get_value()))
+        if self.renderer.viewDistance not in range(2,32,2):
+            self.renderer.viewDistance = 8
         self.viewDistanceReadout = ChoiceButton(["%s"%a for a in range(2,34,2)], width=20, ref=AttrRef(self.renderer, "viewDistance"), choose=chooseDistance)
         self.viewDistanceReadout.selectedChoice = "%s"%self.renderer.viewDistance
         self.viewDistanceReadout.shrink_wrap()
 
-
         def showViewOptions():
-            col = [CheckBoxLabel("Entities", fg_color=(0xff, 0x22, 0x22),
+            col = [CheckBoxLabel("Entities", expand=0, fg_color=(0xff, 0x22, 0x22),
                                  ref=config.settings.drawEntities),
-                   CheckBoxLabel("Items", fg_color=(0x22, 0xff, 0x22), ref=config.settings.drawItems),
-                   CheckBoxLabel("TileEntities", fg_color=(0xff, 0xff, 0x22),
+                   CheckBoxLabel("Items", expand=0, fg_color=(0x22, 0xff, 0x22), ref=config.settings.drawItems),
+                   CheckBoxLabel("TileEntities", expand=0, fg_color=(0xff, 0xff, 0x22),
                                  ref=config.settings.drawTileEntities),
-                   CheckBoxLabel("TileTicks", ref=config.settings.drawTileTicks),
-                   CheckBoxLabel("Player Heads", ref=config.settings.drawPlayerHeads),
-                   CheckBoxLabel("Unpopulated Chunks", fg_color=renderer.TerrainPopulatedRenderer.color,
+                   CheckBoxLabel("TileTicks", expand=0, ref=config.settings.drawTileTicks),
+                   CheckBoxLabel("Player Heads", expand=0, ref=config.settings.drawPlayerHeads),
+                   CheckBoxLabel("Unpopulated Chunks", expand=0, fg_color=renderer.TerrainPopulatedRenderer.color,
                                  ref=config.settings.drawUnpopulatedChunks),
-                   CheckBoxLabel("Chunks Borders", fg_color=renderer.ChunkBorderRenderer.color,
+                   CheckBoxLabel("Chunks Borders", expand=0, fg_color=renderer.ChunkBorderRenderer.color,
                                  ref=config.settings.drawChunkBorders),
-                   CheckBoxLabel("Sky", ref=config.settings.drawSky),
-                   CheckBoxLabel("Fog", ref=config.settings.drawFog),
-                   CheckBoxLabel("Ceiling", ref=config.settings.showCeiling),
-                   CheckBoxLabel("Chunk Redraw", fg_color=(0xff, 0x99, 0x99),
+                   CheckBoxLabel("Sky", expand=0, ref=config.settings.drawSky),
+                   CheckBoxLabel("Fog", expand=0, ref=config.settings.drawFog),
+                   CheckBoxLabel("Ceiling", expand=0, ref=config.settings.showCeiling),
+                   CheckBoxLabel("Chunk Redraw", expand=0, fg_color=(0xff, 0x99, 0x99),
                                  ref=config.settings.showChunkRedraw),
-                   CheckBoxLabel("Hidden Ores", ref=config.settings.showHiddenOres,
+                   CheckBoxLabel("Hidden Ores", expand=0, ref=config.settings.showHiddenOres,
                                  tooltipText="Check to show/hide specific ores using the settings below.")]
 
             for ore in config.settings.hiddableOres.get():
-                col.append(CheckBoxLabel(self.level.materials[ore].name.replace(" Ore", ""),
+                col.append(CheckBoxLabel("* " + _(self.level.materials[ore].name.replace(" Ore", "")), expand=0,
                                          ref=config.settings["showOre{}".format(ore)]))
 
-            col = Column(col, align="r", spacing=4)
+            col = Column(col, align="r", spacing=4, expand='h')
 
             d = QuickDialog()
             d.add(col)
+
             d.shrink_wrap()
             d.topleft = self.viewButton.bottomleft
             d.present(centered=False)
 
         self.viewButton = Button("Show...", action=showViewOptions)
-        
+
         self.waypointManager = WaypointManager(editor=self)
         self.waypointManager.load()
         #self.loadWaypoints()
@@ -323,6 +337,8 @@ class LevelEditor(GLViewport):
             self.statusLabel.width = self.width
             self.topRow.calc_size()
             self.controlPanel.set_update_ui(v)
+            # Update the unparented widgets.
+            [a.set_update_ui(v) for a in unparented.values()]
     #-#
 
     def __del__(self):
@@ -419,8 +435,8 @@ class LevelEditor(GLViewport):
 
     def mouse_down_session(self, evt):
         class SessionLockOptions(Panel):
-            def __init__(self):
-                Panel.__init__(self)
+            def __init__(self, parent):
+                Panel.__init__(self, parent)
                 self.autoChooseCheckBox = CheckBoxLabel("Override Minecraft Changes (Not Recommended)",
                                                         ref=config.session.override,
                                                         tooltipText="Always override Minecraft changes when map is open in MCEdit. (Not recommended)")
@@ -431,7 +447,7 @@ class LevelEditor(GLViewport):
                 self.shrink_wrap()
 
         if evt.button == 3:
-            sessionLockPanel = SessionLockOptions()
+            sessionLockPanel = SessionLockOptions(self)
             sessionLockPanel.present()
 
     _viewMode = None
@@ -691,7 +707,7 @@ class LevelEditor(GLViewport):
                 types[:b.shape[0]] = types[:b.shape[0]].astype(int) + b
 
                 for ent in chunk.getEntitiesInBox(box):
-                    entID = Entity.getId(ent["id"].value)
+                    entID = level.__class__.entityClass.getId(ent["id"].value)
                     if ent["id"].value == "Item":
                         try:
                             v = pymclevel.items.items.findItem(ent["Item"]["id"].value,
@@ -714,18 +730,18 @@ class LevelEditor(GLViewport):
 
         blockCounts = sorted([(level.materials[t & 0xfff, t >> 12], types[t]) for t in presentTypes[0]])
 
-        blockRows = [("", "", ""), (box.volume, "<Blocks>", "")]
+        blockRows = [("", "", ""), (box.volume, "<%s>"%_("Blocks"), "")]
         rows = list(blockRows)
-        rows.extend([[count, block.name, ("({0}:{1})".format(block.ID, block.blockData))] for block, count in blockCounts])
+        rows.extend([[count, trn(block.name), ("({0}:{1})".format(block.ID, block.blockData))] for block, count in blockCounts])
         #rows.sort(key=lambda x: alphanum_key(x[2]), reverse=True)
 
         def extendEntities():
             if entitySum:
-                rows.extend([("", "", ""), (entitySum, "<Entities>", "")])
-                rows.extend([(count, id[1], id[0]) for (id, count) in sorted(entityCounts.iteritems())])
+                rows.extend([("", "", ""), (entitySum, "<%s>"%_("Entities"), "")])
+                rows.extend([(count, trn(id[1]), id[0]) for (id, count) in sorted(entityCounts.iteritems())])
             if tileEntitySum:
-                rows.extend([("", "", ""), (tileEntitySum, "<TileEntities>", "")])
-                rows.extend([(count, id, "") for (id, count) in sorted(tileEntityCounts.iteritems())])
+                rows.extend([("", "", ""), (tileEntitySum, "<%s>"%_("TileEntities"), "")])
+                rows.extend([(count, trn(id), "") for (id, count) in sorted(tileEntityCounts.iteritems())])
 
         extendEntities()
 
@@ -781,7 +797,17 @@ class LevelEditor(GLViewport):
                 except Exception, e:
                     alert(str(e))
                 else:
-                    csvfile.writerows(rows)
+                    for row in rows:
+                        _row=[]
+                        if row == ("", "", ""):
+                            _row = ["Number", "Type", "ID"]
+                        else:
+                            for a in row:
+                                if type(a) == unicode:
+                                    _row.append(a.encode('utf-8'))
+                                else:
+                                    _row.append(a)
+                        csvfile.writerow(_row)
 
         saveButton = Button("Save to file...", action=saveToFile)
         col = Column((Label("Analysis"), tableBacking, saveButton))
@@ -804,13 +830,16 @@ class LevelEditor(GLViewport):
 
         dlg.dispatch_key = dispatch_key
         dlg.present()
-
+        
     def exportSchematic(self, schematic):
         filename = mcplatform.askSaveSchematic(
-            directories.schematicsDir, self.level.displayName, "schematic")
+            directories.schematicsDir, self.level.displayName, ({"Minecraft Schematics": ["schematic"], "Minecraft Structure NBT": ["nbt"]},[]))
 
         if filename:
-            schematic.saveToFile(filename)
+            if filename.endswith(".schematic"):
+                schematic.saveToFile(filename)
+            elif filename.endswith(".nbt"):
+                StructureNBT.fromSchematic(schematic).save(filename)
 
     def getLastCopiedSchematic(self):
         if len(self.copyStack) == 0:
@@ -842,8 +871,45 @@ class LevelEditor(GLViewport):
     def no(self):
         self.yon.dismiss()
         self.user_yon_response = False
+        
+    def _resize_selection_box(self, new_box):
+        import inspect # Let's get our hands dirty
+        stack = inspect.stack()
+        filename = os.path.basename(stack[1][1])
+        old_box = self.selectionTool.selectionBox()
+        msg = """
+        Filter "{0}" wants to resize the selection box
+        Origin: {1} -> {2}
+        Size: {3} -> {4}
+        Do you want to resize the Selection Box?""".format(
+                   filename, 
+                   (old_box.origin[0], old_box.origin[1], old_box.origin[2]), 
+                   (new_box.origin[0], new_box.origin[1], new_box.origin[2]), 
+                   (old_box.size[0], old_box.size[1], old_box.size[2]), 
+                   (new_box.size[0], new_box.size[1], new_box.size[2])
+                   )
+        result = ask(msg, ["Yes", "No"])
+        if result == "Yes":
+            self.selectionTool.setSelection(new_box)
+            return new_box
+        else:
+            return False
+    
+    def addExternalWidget(self, obj):
+        if isinstance(obj, Widget):
+            return self.addExternalWidget_Widget(obj)
+        elif isinstance(obj, dict):
+            return self.addExternalWidget_Dict(obj)
+        
+    def addExternalWidget_Widget(self, obj):
+        obj.shrink_wrap()
+        result = Dialog(obj, ["Ok", "Cancel"]).present()
+        if result == "Ok":
+            print obj
+        else:
+            return 'user canceled'
 
-    def addExternalWidget(self, provided_fields):
+    def addExternalWidget_Dict(self, provided_fields):
 
         def addNumField(wid, name, val, minimum=None, maximum=None, increment=0.1):
             if isinstance(val, float):
@@ -1128,6 +1194,7 @@ class LevelEditor(GLViewport):
             return
 
         assert level
+        log.debug("Loaded world is %s"%repr(level))
 
         if addToRecent:
             self.mcedit.addRecentWorld(filename)
@@ -1163,6 +1230,12 @@ class LevelEditor(GLViewport):
                 self.mainViewport.pitch = 0.0
 
         self.removeNetherPanel()
+
+        gameVersion = level.gameVersion
+        if gameVersion in ('Schematic'):
+            log.info('Loading \'%s\' file.'%gameVersion)
+        else:
+            log.info('Loading world for version {}.'.format({True: "pior to 1.9 (detection says 'Unknown')", False: gameVersion}[gameVersion == 'Unknown']))
 
         self.loadLevel(level)
 
@@ -1244,9 +1317,13 @@ class LevelEditor(GLViewport):
                 self.viewButton, self.viewportButton, self.recordUndoButton))
             self.add(self.topRow, 0)
             self.level.sessionLockLock = self.sessionLockLock
-            #!# Adding waypoints handling for all world types
-        self.waypointManager = WaypointManager(os.path.dirname(self.level.filename), self)
-        self.waypointManager.load()
+        #!# Adding waypoints handling for all world types
+        # Need to take care of the dimension.
+        # If the camera last position was saved, changing dimension is broken; the view is sticked to the overworld.
+        #!#
+        if self.prev_dimension == self.new_dimension:
+            self.waypointManager = WaypointManager(os.path.dirname(self.level.filename), self)
+            self.waypointManager.load()
 
 
         if len(list(self.level.allChunks)) == 0:
@@ -1285,7 +1362,10 @@ class LevelEditor(GLViewport):
     def gotoDimension(self, dimNo):
         if dimNo == self.level.dimNo:
             return
-        elif dimNo == -1 and self.level.dimNo == 0:
+        else:
+            # Record the new dimension
+            self.new_dimension = dimNo
+        if dimNo == -1 and self.level.dimNo == 0:
             self.gotoNether()
         elif dimNo == 0 and self.level.dimNo == -1:
             self.gotoEarth()
@@ -1303,10 +1383,14 @@ class LevelEditor(GLViewport):
 
     def initWindowCaption(self):
         filename = self.level.filename
-        s = os.path.split(filename)
-        title = os.path.split(s[0])[1] + os.sep + s[1] + _(u" - MCEdit ~ ") + release.get_version()
-        if DEF_ENC != "UTF-8":
-            title = title.encode('utf-8')
+#         s = os.path.split(filename)
+#         title = os.path.split(s[0])[1] + os.sep + s[1] + u" - MCEdit ~ " + release.get_version()%_("for")
+        last_dir, f_name = os.path.split(filename)
+        last_dir = os.path.basename(last_dir)
+        title = u"{f_name} - Unified ~ {ver}".format(f_name=os.path.join(last_dir, f_name), ver=release.get_version()%_("for"))
+#        if DEF_ENC != "UTF-8":
+#            title = title.encode('utf-8')
+        title = title.encode('utf-8')
         display.set_caption(title)
 
     @mceutils.alertException
@@ -1380,7 +1464,8 @@ class LevelEditor(GLViewport):
     def saveAs(self):
         shortName = os.path.split(os.path.split(self.level.filename)[0])[1]
         filename = mcplatform.askSaveFile(directories.minecraftSaveFileDir, _("Name the new copy."),
-                                          shortName + " - Copy", _('Minecraft World\0*.*\0\0'), "")
+                                        shortName + " - Copy", _('Minecraft World\0*.*\0\0'), "")
+#                                           shortName + " - Copy", "", "")
         if filename is None:
             return
         shutil.copytree(self.level.worldFolder.filename, filename)
@@ -2039,7 +2124,7 @@ class LevelEditor(GLViewport):
         self.renderer.level = None
         self.mcedit.removeEditor()
         self.controlPanel.dismiss()
-        display.set_caption("MCEdit ~ " + release.get_version())
+        display.set_caption(("MCEdit ~ " + release.get_version()%_("for")).encode('utf-8'))
         if self.revertPlayerSkins:
             config.settings.downloadPlayerSkins.set(True)
             self.revertPlayerSkins = False
@@ -2105,7 +2190,7 @@ class LevelEditor(GLViewport):
             self.renderer.level = None
             self.mcedit.removeEditor()
             self.controlPanel.dismiss()
-            display.set_caption("MCEdit ~ " + release.get_version())
+            display.set_caption(("MCEdit ~ " + release.get_version()%_("for")).encode('utf-8'))
 
             self._ftp_client.cleanup()
         else:
@@ -2162,23 +2247,6 @@ class LevelEditor(GLViewport):
 
     @mceutils.alertException
     def showWorldInfo(self):
-        ticksPerDay = 24000
-        ticksPerHour = ticksPerDay / 24
-        ticksPerMinute = ticksPerDay / (24 * 60)
-
-        def decomposeMCTime(time):
-            day = time / ticksPerDay
-            tick = time % ticksPerDay
-            hour = tick / ticksPerHour
-            tick %= ticksPerHour
-            minute = tick / ticksPerMinute
-            tick %= ticksPerMinute
-
-            return day, hour, minute, tick
-
-        def composeMCTime(d, h, m, t):
-            time = d * ticksPerDay + h * ticksPerHour + m * ticksPerMinute + t
-            return time
 
         worldInfoPanel = Dialog()
         items = []
@@ -2221,17 +2289,9 @@ class LevelEditor(GLViewport):
             # timezone adjust -
             # minecraft time shows 0:00 on day 0 at the first sunrise
             # I want that to be 6:00 on day 1, so I add 30 hours
-            timezoneAdjust = ticksPerHour * 30
-            time += timezoneAdjust
 
-            d, h, m, tick = decomposeMCTime(time)
-
-            dayInput = IntField(value=d, min=1)
-            items.append(Row((Label("Day: "), dayInput)))
-
-            timeInput = TimeField(value=(h, m))
-            timeInputRow = Row((Label("Time of day:"), timeInput))
-            items.append(timeInputRow)
+            time_editor = TimeEditor(current_tick_time=time)
+            items.append(time_editor)
 
         if hasattr(self.level, 'RandomSeed'):
             seedField = IntField(width=250, value=self.level.RandomSeed)
@@ -2286,6 +2346,7 @@ class LevelEditor(GLViewport):
         size = self.level.size
         sizelabel = Label("{L}L x {W}W x {H}H".format(L=size[2], H=size[1], W=size[0]))
         items.append(sizelabel)
+        #items.append(TimeEditor(current_tick_time=0))
 
         if hasattr(self.level, "Entities"):
             label = Label(_("{0} Entities").format(len(self.level.Entities)))
@@ -2305,10 +2366,12 @@ class LevelEditor(GLViewport):
         def cancel(*args, **kwargs):
             Changes = False
             if hasattr(self.level, 'Time'):
-                h, m = timeInput.value
-                time = composeMCTime(dayInput.value, h, m, tick)
-                time -= timezoneAdjust
+                time = time_editor.get_time_value()
                 if self.level.Time != time:
+                    Changes = True
+            if hasattr(self.level, 'DayTime'):
+                day_time = time_editor.get_daytime_value()
+                if self.level.DayTime != day_time:
                     Changes = True
             if hasattr(self.level, 'RandomSeed'):
                 if seedField.value != self.level.RandomSeed:
@@ -2360,6 +2423,7 @@ class LevelEditor(GLViewport):
 
                 self.changeLevelName = changeLevelName
                 self.changeTime = changeTime
+                self.changeDayTime = changeDayTime
                 self.changeSeed = changeSeed
                 self.changeGameType = changeGameType
 
@@ -2372,6 +2436,10 @@ class LevelEditor(GLViewport):
                     if changeTime:
                         self.UndoTime = self.level.Time
                         self.RedoTime = time
+                        
+                    if changeDayTime:
+                        self.UndoDayTime = self.level.DayTime
+                        self.RedoDayTime = day_time
 
                     if changeSeed:
                         self.UndoSeed = self.level.RandomSeed
@@ -2385,6 +2453,8 @@ class LevelEditor(GLViewport):
                     self.level.LevelName = nameField.value
                 if changeTime:
                     self.level.Time = time
+                if changeDayTime:
+                    self.level.DayTime = day_time
                 if changeSeed:
                     self.level.RandomSeed = seedField.value
                 if changeGameType:
@@ -2395,6 +2465,8 @@ class LevelEditor(GLViewport):
                     self.level.LevelName = self.UndoText
                 if self.changeTime:
                     self.level.Time = self.UndoTime
+                if self.changeDayTime:
+                    self.level.DayTime = self.UndoDayTime
                 if self.changeSeed:
                     self.level.RandomSeed = self.UndoSeed
                 if self.changeGameType:
@@ -2405,6 +2477,8 @@ class LevelEditor(GLViewport):
                     self.level.LevelName = self.RedoText
                 if self.changeTime:
                     self.level.Time = self.RedoTime
+                if self.changeDayTime:
+                    self.level.DayTime = self.RedoDayTime
                 if self.changeSeed:
                     self.level.RandomSeed = self.RedoSeed
                 if self.changeGameType:
@@ -2414,13 +2488,17 @@ class LevelEditor(GLViewport):
         changeSeed = False
         changeLevelName = False
         changeGameType = False
+        changeDayTime = False
 
         if hasattr(self.level, 'Time'):
-            h, m = timeInput.value
-            time = composeMCTime(dayInput.value, h, m, tick)
-            time -= timezoneAdjust
+            time = time_editor.get_time_value()
             if self.level.Time != time:
                 changeTime = True
+                
+        if hasattr(self.level, 'DayTime'):
+            day_time = time_editor.get_daytime_value()
+            if self.level.DayTime != day_time:
+                changeDayTime = True
 
         if hasattr(self.level, 'RandomSeed'):
             if seedField.value != self.level.RandomSeed:
@@ -2607,7 +2685,7 @@ class LevelEditor(GLViewport):
     def askOpenFile(self):
         self.mouseLookOff()
         try:
-            filename = mcplatform.askOpenFile()
+            filename = mcplatform.askOpenFile(schematics=True)
             if filename:
                 self.parent.loadFile(filename)
         except Exception:
@@ -2950,7 +3028,7 @@ class LevelEditor(GLViewport):
                 col = Column((label, progress), align="l", width=200)
                 infos.append(col)
 
-        panel = Panel()
+        panel = Panel(parent=self)
         if len(infos):
             panel.add(Column(infos))
             panel.shrink_wrap()
@@ -3321,6 +3399,12 @@ class EditorToolbar(GLOrtho):
         toolNumber = float(len(self.tools)) * x / tw
         return min(int(toolNumber), len(self.tools) - 1)
 
+    def set_update_ui(self, v):
+        for tool in self.tools:
+            if tool.optionsPanel:
+                tool.optionsPanel.set_update_ui(v)
+        GLOrtho.set_update_ui(self, v)
+
     def mouse_down(self, evt):
         if self.parent.level:
             toolNo = self.toolNumberUnderMouse(evt.pos)
@@ -3544,3 +3628,4 @@ from albow.resource import get_image
 #             self.editor.sessionLockLock.tooltipText = "Session Lock is being used by Minecraft"
 #             self.editor.sessionLockLabel.tooltipText = "Session Lock is being used by Minecraft"
 #         if "Re-acquired session lock" in message:
+

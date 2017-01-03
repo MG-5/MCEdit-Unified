@@ -1,4 +1,4 @@
-from OpenGL import GL
+from OpenGL import GL, GLU
 from config import config
 import pygame
 from pygame import display, image, Surface
@@ -10,12 +10,13 @@ import os
 import mcplatform
 import numpy
 import pymclevel
-import resource_packs
+from resource_packs import ResourcePackHandler
 import glutils
 import mceutils
 import functools
 
 DEBUG_WM = mcplatform.DEBUG_WM
+USE_WM = mcplatform.USE_WM
 
 
 class GLDisplayContext(object):
@@ -49,13 +50,14 @@ class GLDisplayContext(object):
             print "wwh 1", wwh
         d = display.set_mode(wwh, self.displayMode())
 
+        # Let initialize OpenGL stuff after the splash.
         GL.glEnableClientState(GL.GL_VERTEX_ARRAY)
         GL.glAlphaFunc(GL.GL_NOTEQUAL, 0)
         GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
-
+ 
         # textures are 256x256, so with this we can specify pixel coordinates
-        GL.glMatrixMode(GL.GL_TEXTURE)
-        GL.glScale(1 / 256., 1 / 256., 1 / 256.)
+#        GL.glMatrixMode(GL.GL_TEXTURE)
+#        GL.glScale(1 / 256., 1 / 256., 1 / 256.)
 
         display.set_caption(*caption)
 
@@ -63,7 +65,7 @@ class GLDisplayContext(object):
             self.win = mcplatform.WindowHandler(mode=self.displayMode())
 
         # The following Windows specific code won't be executed if we're using '--debug-wm' switch.
-        if not DEBUG_WM and sys.platform == 'win32' and config.settings.setWindowPlacement.get():
+        if not USE_WM and sys.platform == 'win32' and config.settings.setWindowPlacement.get():
             config.settings.setWindowPlacement.set(False)
             config.save()
             X, Y = config.settings.windowX.get(), config.settings.windowY.get()
@@ -100,17 +102,25 @@ class GLDisplayContext(object):
                 print "wwh 2", wwh
 
         if splash:
-            GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
-            GL.glWindowPos2d(0, 0)
-            back = Surface(wwh)
-            back.fill((0, 0, 0))
-            GL.glDrawPixels(wwh[0], wwh[1], GL.GL_RGBA, GL.GL_UNSIGNED_BYTE,
-                            numpy.fromstring(image.tostring(back, 'RGBA'), dtype='uint8'))
+            # Setup the OGL display
+            GL.glLoadIdentity()
+            GLU.gluOrtho2D(0, wwh[0], 0, wwh[1])
+            GL.glClear(GL.GL_COLOR_BUFFER_BIT | GL.GL_DEPTH_BUFFER_BIT | GL.GL_ACCUM_BUFFER_BIT | GL.GL_STENCIL_BUFFER_BIT)
+
             swh = splash.get_size()
             _x, _y = (wwh[0] / 2 - swh[0] / 2, wwh[1] / 2 - swh[1] / 2)
             w, h = swh
-            data = image.tostring(splash, 'RGBA', 1)
-            GL.glWindowPos2d(_x, _y)
+
+            try:
+                data = image.tostring(splash, 'RGBA_PREMULT', 1)
+            except ValueError:
+                data = image.tostring(splash, 'RGBA', 1)
+            except ValueError:
+                data = image.tostring(splash, 'RGB', 1)
+
+            # Set the raster position
+            GL.glRasterPos(_x, _y)
+
             GL.glDrawPixels(w, h,
                             GL.GL_RGBA, GL.GL_UNSIGNED_BYTE, numpy.fromstring(data, dtype='uint8'))
 
@@ -133,6 +143,15 @@ class GLDisplayContext(object):
             display.set_icon(icon)
         except Exception, e:
             logging.warning('Unable to set icon: {0!r}'.format(e))
+
+        # Let initialize OpenGL stuff after the splash.
+#         GL.glEnableClientState(GL.GL_VERTEX_ARRAY)
+#         GL.glAlphaFunc(GL.GL_NOTEQUAL, 0)
+#         GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
+ 
+        # textures are 256x256, so with this we can specify pixel coordinates
+        GL.glMatrixMode(GL.GL_TEXTURE)
+        GL.glScale(1 / 256., 1 / 256., 1 / 256.)
 
         self.display = d
 
@@ -164,7 +183,7 @@ class GLDisplayContext(object):
         textures = (
             (pymclevel.classicMaterials, 'terrain-classic.png'),
             (pymclevel.indevMaterials, 'terrain-classic.png'),
-            (pymclevel.alphaMaterials, resource_packs.packs.get_selected_resource_pack().terrain_path()),
+            (pymclevel.alphaMaterials, ResourcePackHandler.Instance().get_selected_resource_pack().terrain_path()),
             (pymclevel.pocketMaterials, 'terrain-pocket.png')
         )
 
@@ -184,3 +203,4 @@ class GLDisplayContext(object):
                     functools.partial(makeTerrainTexture, mats)
                 )
             mats.terrainTexture = self.terrainTextures[mats.name]
+

@@ -5,12 +5,10 @@ from os.path import join
 from collections import defaultdict
 from pprint import pformat
 import mclangres
-
+import json
 import os
 
-NOTEX = (0x1F0, 0x1F0)
-
-import yaml
+NOTEX = (496, 496)
 
 log = getLogger(__name__)
 
@@ -55,9 +53,122 @@ class Block(object):
 
 id_limit = 4096
 
+class BlockstateAPI(object):
+    material_map = {}
+    
+    def __init__(self, mats, definition_file):
+        self._mats = mats
+        self.block_map = {}
+        self.blockstates = {}
+        
+        for b in self._mats:
+            if b.ID == 0:
+                b.stringID = "air"
+            self.block_map[b.ID] = "minecraft:" + b.stringID
+        
+        with open(os.path.join("pymclevel", definition_file)) as def_file:
+            self.blockstates = json.load(def_file)
+            
+        self.material_map[self._mats] = self
+        
+    def idToBlockstate(self, bid, data):
+        '''
+        Converts from a numerical ID to a BlockState string
+    
+        :param bid: The ID of the block
+        :type bid: int
+        :param data: The data value of the block
+        :type data: int
+        :return: The BlockState string
+        :rtype: str
+        '''       
+        if bid not in self.block_map:
+            return ("<Unknown>", {})
+        
+        name = self.block_map[bid].replace("minecraft:", "")
+
+        if name not in self.blockstates["minecraft"]:
+            return ("<Unknown>", {})
+        
+        properties = {}
+        for prop in self.blockstates["minecraft"][name]["properties"]: # TODO: Change this if MCEdit's mod support ever improves
+            if prop["<data>"] == data:
+                for field in prop.keys():
+                    if field == "<data>":
+                        continue
+                    properties[field] = prop[field]
+                return (name, properties)
+        return (name, properties)
+    
+    def blockstateToID(self, name, properties):
+        '''
+        Converts from a BlockState to a numerical ID/Data pair
+    
+        :param name: The BlockState name
+        :type name: str
+        :param properties: A list of Property/Value pairs in dict form
+        :type properties: list
+        :return: A tuple containing the numerical ID/Data pair (<id>, <data>)
+        :rtype: tuple
+        '''
+        
+        if ":" in name:
+            prefix, name = name.split(":")
+        else:
+            prefix = "minecraft"
+            
+        if prefix not in self.blockstates:
+            return (-1, -1)
+        elif name not in self.blockstates[prefix]:
+            return (-1, -1)
+        
+        bid = self.blockstates[prefix][name]["id"]
+        for prop in self.blockstates[prefix][name]["properties"]:
+            correct = True
+            for (key, value) in properties.iteritems():
+                if key in prop:
+                    correct = correct and (prop[key] == value)
+            if correct:
+                return (bid, prop["<data>"])
+        return (bid, 0)
+    
+    @staticmethod
+    def stringifyBlockstate(name, properties):
+        if not name.startswith("minecraft:"):
+            name = "minecraft:" + name # This should be changed as soon as possible
+        result = name + "["
+        for (key, value) in properties.iteritems():
+            result += "{}={},".format(key, value)
+        if result.endswith("["):
+            return result[:-1]
+        return result[:-1] + "]"
+    
+    @staticmethod
+    def deStringifyBlockstate(blockstate):
+        seperated = blockstate.split("[")
+        
+        if len(seperated) == 1:
+            if not seperated[0].startswith("minecraft:"):
+                seperated[0] = "minecraft:" + seperated[0] 
+            return (seperated[0], {})
+        
+        name, props = seperated
+        
+        if not name.startswith("minecraft:"):
+            name = "minecraft:" + name
+            
+        properties = {}
+    
+        props = props[:-1]
+        props = props.split(",")
+        for prop in props:
+            prop = prop.split("=")
+            properties[prop[0]] = prop[1]
+        return (name, properties)
+
 
 class MCMaterials(object):
-    defaultColor = (0xc9, 0x77, 0xf0, 0xff)
+    defaultColor = (201, 119, 240, 255)
     defaultBrightness = 0
     defaultOpacity = 15
     defaultTexture = NOTEX
@@ -95,10 +206,11 @@ class MCMaterials(object):
         self.color = self.flatColors
         self.brightness = self.lightEmission
         self.opacity = self.lightAbsorption
+        self.types = {}
 
         self.Air = self.addBlock(0,
                                  name="Air",
-                                 texture=(0x0, 0x150),
+                                 texture=(0, 336),
                                  opacity=0,
         )
 
@@ -140,10 +252,25 @@ class MCMaterials(object):
             for b in self.allBlocks:
                 if b.name == key:
                     return b
+            if "[" not in key:
+                lowest_block = None
+                for b in self.allBlocks:
+                    if ("minecraft:{}".format(b.idStr) == key or b.idStr == key):
+                        if b.blockData == 0:
+                            return b
+                        elif not lowest_block:
+                            lowest_block = b
+                        elif lowest_block.blockData > b.blockData:
+                            lowest_block = b
+                if lowest_block:
+                    return lowest_block
+            elif self.blockstate_api:
+                name, properties = self.blockstate_api.deStringifyBlockstate(key)
+                return self[self.blockstate_api.blockstateToID(name, properties)]
             raise KeyError("No blocks named: " + key)
         if isinstance(key, (tuple, list)):
-            id, blockData = key
-            return self.blockWithID(id, blockData)
+            block_id, blockData = key
+            return self.blockWithID(block_id, blockData)
         return self.blockWithID(key)
 
     def blocksMatching(self, name, names=None):
@@ -175,14 +302,17 @@ class MCMaterials(object):
                 toReturn.append(v)
         return toReturn
 
-    def blockWithID(self, id, data=0):
-        if (id, data) in self.blocksByID:
-            return self.blocksByID[id, data]
+    def blockWithID(self, block_id, data=0):
+        if (block_id, data) in self.blocksByID:
+            return self.blocksByID[block_id, data]
         else:
-            bl = Block(self, id, blockData=data)
+            bl = Block(self, block_id, blockData=data)
             return bl
+        
+    def setup_blockstates(self, blockstate_definition_file):
+        self.blockstate_api = BlockstateAPI(self, blockstate_definition_file)
 
-    def addYamlBlocksFromFile(self, filename):
+    def addJSONBlocksFromFile(self, filename):
         try:
             import pkg_resources
 
@@ -197,29 +327,25 @@ class MCMaterials(object):
             f = file(path)
         try:
             log.info(u"Loading block info from %s", f)
-            try:
-                log.debug("Trying YAML CLoader")
-                blockyaml = yaml.load(f, Loader=yaml.CLoader)
-            except:
-                log.debug("CLoader not preset, falling back to Python YAML")
-                blockyaml = yaml.load(f)
-            self.addYamlBlocks(blockyaml)
+            blockyaml = json.load(f)
+            #blockyaml = yaml.load(f)
+            self.addJSONBlocks(blockyaml)
 
         except Exception, e:
             log.warn(u"Exception while loading block info from %s: %s", f, e)
             traceback.print_exc()
 
-    def addYamlBlocks(self, blockyaml):
+    def addJSONBlocks(self, blockyaml):
         self.yamlDatas.append(blockyaml)
         for block in blockyaml['blocks']:
             try:
-                self.addYamlBlock(block)
+                self.addJSONBlock(block)
             except Exception, e:
                 log.warn(u"Exception while parsing block: %s", e)
                 traceback.print_exc()
                 log.warn(u"Block definition: \n%s", pformat(block))
 
-    def addYamlBlock(self, kw):
+    def addJSONBlock(self, kw):
         blockID = kw['id']
 
         # xxx unused_yaml_properties variable unused; needed for
@@ -279,20 +405,24 @@ class MCMaterials(object):
                 rot = (5, 0, 2, 3, 4, 1)
                 texture[:] = [texture[r] for r in rot]
 
-            for data, dir in tex_direction_data.items():
-                for _i in range(texDirMap.get(dir, 0)):
+            for data, direction in tex_direction_data.items():
+                for _i in range(texDirMap.get(direction, 0)):
                     rot90cw()
-                self.blockTextures[blockID][data] = texture
+                self.blockTextures[blockID][int(data)] = texture
 
     def addBlock(self, blockID, blockData=0, **kw):
-        name = kw.pop('name', self.names[blockID][blockData])
+        blockData = int(blockData)
+        try:
+            name = kw.pop('name', self.names[blockID][blockData])
+        except:
+            print (blockID, blockData)
         stringName = kw.pop('idStr', '')
 
         self.lightEmission[blockID] = kw.pop('brightness', self.defaultBrightness)
         self.lightAbsorption[blockID] = kw.pop('opacity', self.defaultOpacity)
         self.aka[blockID][blockData] = kw.pop('aka', "")
         self.search[blockID][blockData] = kw.pop('search', "")
-        type = kw.pop('type', 'NORMAL')
+        block_type = kw.pop('type', 'NORMAL')
 
         color = kw.pop('mapcolor', self.flatColors[blockID, blockData])
         self.flatColors[blockID, blockData] = (tuple(color) + (255,))[:4]
@@ -304,15 +434,15 @@ class MCMaterials(object):
 
         self.names[blockID][blockData] = name
         if blockData is 0:
-            self.type[blockID] = [type] * 16
+            self.type[blockID] = [block_type] * 16
         else:
-            self.type[blockID][blockData] = type
+            self.type[blockID][blockData] = block_type
 
         block = Block(self, blockID, blockData, stringName)
 
         if kw.pop('invalid', 'false') == 'false':
             self.allBlocks.append(block)
-        self.blocksByType[type].append(block)
+        self.blocksByType[block_type].append(block)
 
         self.blocksByID[blockID, blockData] = block
 
@@ -321,19 +451,21 @@ class MCMaterials(object):
 
 alphaMaterials = MCMaterials(defaultName="Future Block!")
 alphaMaterials.name = "Alpha"
-alphaMaterials.addYamlBlocksFromFile("minecraft.yaml")
+alphaMaterials.addJSONBlocksFromFile("minecraft.json")
+alphaMaterials.setup_blockstates("pc_blockstates.json")
 
 classicMaterials = MCMaterials(defaultName="Not present in Classic")
 classicMaterials.name = "Classic"
-classicMaterials.addYamlBlocksFromFile("classic.yaml")
+classicMaterials.addJSONBlocksFromFile("classic.json")
 
 indevMaterials = MCMaterials(defaultName="Not present in Indev")
 indevMaterials.name = "Indev"
-indevMaterials.addYamlBlocksFromFile("indev.yaml")
+indevMaterials.addJSONBlocksFromFile("indev.json")
 
 pocketMaterials = MCMaterials()
 pocketMaterials.name = "Pocket"
-pocketMaterials.addYamlBlocksFromFile("pocket.yaml")
+pocketMaterials.addJSONBlocksFromFile("pocket.json")
+pocketMaterials.setup_blockstates("pe_blockstates.json")
 
 # --- Static block defs ---
 
@@ -603,6 +735,14 @@ alphaMaterials.PurpurPillar = alphaMaterials[202, 0]
 alphaMaterials.PurpurStairs = alphaMaterials[203, 0]
 alphaMaterials.PurpurSlab = alphaMaterials[205, 0]
 alphaMaterials.EndStone = alphaMaterials[206, 0]
+alphaMaterials.BeetRoot = alphaMaterials[207, 0]
+alphaMaterials.GrassPath = alphaMaterials[208, 0]
+alphaMaterials.EndGateway = alphaMaterials[209, 0]
+alphaMaterials.CommandBlockRepeating = alphaMaterials[210, 0]
+alphaMaterials.CommandBlockChain = alphaMaterials[211, 0]
+alphaMaterials.FrostedIce = alphaMaterials[212, 0]
+alphaMaterials.StructureVoid = alphaMaterials[217, 0]
+alphaMaterials.StructureBlock = alphaMaterials[255, 0]
 
 # --- Classic static block defs ---
 classicMaterials.Stone = classicMaterials[1]
@@ -745,20 +885,31 @@ pocketMaterials.Gravel = pocketMaterials[13, 0]
 pocketMaterials.GoldOre = pocketMaterials[14, 0]
 pocketMaterials.IronOre = pocketMaterials[15, 0]
 pocketMaterials.CoalOre = pocketMaterials[16, 0]
+
 pocketMaterials.Wood = pocketMaterials[17, 0]
 pocketMaterials.PineWood = pocketMaterials[17, 1]
 pocketMaterials.BirchWood = pocketMaterials[17, 2]
+pocketMaterials.JungleWood = pocketMaterials[17, 3]
 pocketMaterials.Leaves = pocketMaterials[18, 0]
+pocketMaterials.PineLeaves = pocketMaterials[18, 1]
+pocketMaterials.BirchLeaves = pocketMaterials[18, 2]
+pocketMaterials.JungleLeaves = pocketMaterials[18, 3]
+
+pocketMaterials.Sponge = pocketMaterials[19, 0]
 pocketMaterials.Glass = pocketMaterials[20, 0]
 
 pocketMaterials.LapisLazuliOre = pocketMaterials[21, 0]
 pocketMaterials.LapisLazuliBlock = pocketMaterials[22, 0]
 pocketMaterials.Sandstone = pocketMaterials[24, 0]
+pocketMaterials.NoteBlock = pocketMaterials[25, 0]
 pocketMaterials.Bed = pocketMaterials[26, 0]
+pocketMaterials.PoweredRail = pocketMaterials[27, 0]
+pocketMaterials.DetectorRail = pocketMaterials[28, 0]
 pocketMaterials.Web = pocketMaterials[30, 0]
 pocketMaterials.UnusedShrub = pocketMaterials[31, 0]
 pocketMaterials.TallGrass = pocketMaterials[31, 1]
 pocketMaterials.Shrub = pocketMaterials[31, 2]
+
 pocketMaterials.WhiteWool = pocketMaterials[35, 0]
 pocketMaterials.OrangeWool = pocketMaterials[35, 1]
 pocketMaterials.MagentaWool = pocketMaterials[35, 2]
@@ -775,12 +926,14 @@ pocketMaterials.BrownWool = pocketMaterials[35, 12]
 pocketMaterials.DarkGreenWool = pocketMaterials[35, 13]
 pocketMaterials.RedWool = pocketMaterials[35, 14]
 pocketMaterials.BlackWool = pocketMaterials[35, 15]
+
 pocketMaterials.Flower = pocketMaterials[37, 0]
 pocketMaterials.Rose = pocketMaterials[38, 0]
 pocketMaterials.BrownMushroom = pocketMaterials[39, 0]
 pocketMaterials.RedMushroom = pocketMaterials[40, 0]
 pocketMaterials.BlockofGold = pocketMaterials[41, 0]
 pocketMaterials.BlockofIron = pocketMaterials[42, 0]
+
 pocketMaterials.DoubleStoneSlab = pocketMaterials[43, 0]
 pocketMaterials.DoubleSandstoneSlab = pocketMaterials[43, 1]
 pocketMaterials.DoubleWoodenSlab = pocketMaterials[43, 2]
@@ -791,6 +944,7 @@ pocketMaterials.SandstoneSlab = pocketMaterials[44, 1]
 pocketMaterials.WoodenSlab = pocketMaterials[44, 2]
 pocketMaterials.CobblestoneSlab = pocketMaterials[44, 3]
 pocketMaterials.BrickSlab = pocketMaterials[44, 4]
+
 pocketMaterials.Brick = pocketMaterials[45, 0]
 pocketMaterials.TNT = pocketMaterials[46, 0]
 pocketMaterials.Bookshelf = pocketMaterials[47, 0]
@@ -799,8 +953,10 @@ pocketMaterials.Obsidian = pocketMaterials[49, 0]
 
 pocketMaterials.Torch = pocketMaterials[50, 0]
 pocketMaterials.Fire = pocketMaterials[51, 0]
+pocketMaterials.MonsterSpawner = pocketMaterials[52, 0]
 pocketMaterials.WoodenStairs = pocketMaterials[53, 0]
 pocketMaterials.Chest = pocketMaterials[54, 0]
+pocketMaterials.RedstoneWire = pocketMaterials[55, 0]
 pocketMaterials.DiamondOre = pocketMaterials[56, 0]
 pocketMaterials.BlockofDiamond = pocketMaterials[57, 0]
 pocketMaterials.CraftingTable = pocketMaterials[58, 0]
@@ -808,12 +964,21 @@ pocketMaterials.Crops = pocketMaterials[59, 0]
 pocketMaterials.Farmland = pocketMaterials[60, 0]
 pocketMaterials.Furnace = pocketMaterials[61, 0]
 pocketMaterials.LitFurnace = pocketMaterials[62, 0]
+pocketMaterials.Sign = pocketMaterials[63,0]
 pocketMaterials.WoodenDoor = pocketMaterials[64, 0]
 pocketMaterials.Ladder = pocketMaterials[65, 0]
+pocketMaterials.Rail = pocketMaterials[66, 0]
 pocketMaterials.StoneStairs = pocketMaterials[67, 0]
+pocketMaterials.WallSign = pocketMaterials[68,0]
+pocketMaterials.Lever = pocketMaterials[69,0]
+pocketMaterials.StoneFloorPlate = pocketMaterials[70,0]
 pocketMaterials.IronDoor = pocketMaterials[71, 0]
+pocketMaterials.WoodFloorPlate = pocketMaterials[72,0]
 pocketMaterials.RedstoneOre = pocketMaterials[73, 0]
 pocketMaterials.RedstoneOreGlowing = pocketMaterials[74, 0]
+pocketMaterials.RedstoneTorchOff = pocketMaterials[75, 0]
+pocketMaterials.RedstoneTorchOn = pocketMaterials[76, 0]
+pocketMaterials.Button = pocketMaterials[77, 0]
 pocketMaterials.SnowLayer = pocketMaterials[78, 0]
 pocketMaterials.Ice = pocketMaterials[79, 0]
 
@@ -822,31 +987,134 @@ pocketMaterials.Cactus = pocketMaterials[81, 0]
 pocketMaterials.Clay = pocketMaterials[82, 0]
 pocketMaterials.SugarCane = pocketMaterials[83, 0]
 pocketMaterials.Fence = pocketMaterials[85, 0]
+pocketMaterials.Pumpkin = pocketMaterials[86, 0]
+pocketMaterials.Netherrack = pocketMaterials[87, 0]
+pocketMaterials.SoulSand = pocketMaterials[88, 0]
 pocketMaterials.Glowstone = pocketMaterials[89, 0]
+pocketMaterials.NetherPortal = pocketMaterials[90, 0]
+pocketMaterials.JackOLantern = pocketMaterials[91, 0]
+pocketMaterials.Cake = pocketMaterials[92, 0]
 pocketMaterials.InvisibleBedrock = pocketMaterials[95, 0]
 pocketMaterials.Trapdoor = pocketMaterials[96, 0]
 
+pocketMaterials.MonsterEgg = pocketMaterials[97, 0]
 pocketMaterials.StoneBricks = pocketMaterials[98, 0]
+pocketMaterials.BrownMushroom = pocketMaterials[99, 0]
+pocketMaterials.RedMushroom = pocketMaterials[100, 0]
+pocketMaterials.IronBars = pocketMaterials[101, 0]
 pocketMaterials.GlassPane = pocketMaterials[102, 0]
 pocketMaterials.Watermelon = pocketMaterials[103, 0]
+pocketMaterials.PumpkinStem = pocketMaterials[104, 0]
 pocketMaterials.MelonStem = pocketMaterials[105, 0]
+pocketMaterials.Vines = pocketMaterials[106, 0]
 pocketMaterials.FenceGate = pocketMaterials[107, 0]
 pocketMaterials.BrickStairs = pocketMaterials[108, 0]
+pocketMaterials.StoneBrickStairs = pocketMaterials[109, 0]
+pocketMaterials.Mycelium = pocketMaterials[110, 0]
+pocketMaterials.Lilypad = pocketMaterials[111, 0]
 
+pocketMaterials.NetherBrick = pocketMaterials[112, 0]
+pocketMaterials.NetherBrickFence = pocketMaterials[113, 0]
+pocketMaterials.NetherBrickStairs = pocketMaterials[114, 0]
+pocketMaterials.NetherWart = pocketMaterials[115, 0]
+
+pocketMaterials.EnchantmentTable = pocketMaterials[116, 0]
+pocketMaterials.BrewingStand = pocketMaterials[117, 0]
+pocketMaterials.EndPortalFrame = pocketMaterials[120, 0]
+pocketMaterials.EndStone = pocketMaterials[121, 0]
+pocketMaterials.RedstoneLampoff = pocketMaterials[122, 0]
+pocketMaterials.RedstoneLampon = pocketMaterials[123, 0]
+pocketMaterials.ActivatorRail = pocketMaterials[126, 0]
+pocketMaterials.Cocoa = pocketMaterials[127, 0]
+pocketMaterials.SandstoneStairs = pocketMaterials[128, 0]
+pocketMaterials.EmeraldOre = pocketMaterials[129, 0]
+pocketMaterials.TripwireHook = pocketMaterials[131, 0]
+pocketMaterials.Tripwire = pocketMaterials[132, 0]
+pocketMaterials.BlockOfEmerald = pocketMaterials[133, 0]
+
+pocketMaterials.SpruceWoodStairs = pocketMaterials[134, 0]
+pocketMaterials.BirchWoodStairs = pocketMaterials[135, 0]
+pocketMaterials.JungleWoodStairs = pocketMaterials[136, 0]
+
+pocketMaterials.CobblestoneWall = pocketMaterials[139, 0]
+pocketMaterials.FlowerPot = pocketMaterials[140, 0]
+pocketMaterials.Carrots = pocketMaterials[141, 0]
+pocketMaterials.Potato = pocketMaterials[142, 0]
+pocketMaterials.WoodenButton = pocketMaterials[143, 0]
+pocketMaterials.MobHead = pocketMaterials[144, 0]
+pocketMaterials.Anvil = pocketMaterials[145, 0]
+pocketMaterials.TrappedChest = pocketMaterials[146, 0]
+pocketMaterials.WeightedPressurePlateLight = pocketMaterials[147, 0]
+pocketMaterials.WeightedPressurePlateHeavy = pocketMaterials[148, 0]
+pocketMaterials.DaylightSensor = pocketMaterials[151, 0]
+pocketMaterials.BlockOfRedstone = pocketMaterials[152, 0]
+pocketMaterials.NetherQuartzOre = pocketMaterials[153, 0]
+pocketMaterials.BlockOfQuartz = pocketMaterials[155, 0]
+pocketMaterials.DoubleWoodenSlab = pocketMaterials[157, 0]
+pocketMaterials.WoodenSlab = pocketMaterials[158, 0]
+pocketMaterials.StainedClay = pocketMaterials[159, 0]
+pocketMaterials.AcaciaLeaves = pocketMaterials[161, 0]
+pocketMaterials.AcaciaWood = pocketMaterials[162, 0]
+pocketMaterials.AcaciaWoodStairs = pocketMaterials[163, 0]
+pocketMaterials.DarkOakWoodStairs = pocketMaterials[164, 0]
+pocketMaterials.IronTrapdoor = pocketMaterials[167, 0]
+pocketMaterials.HayBale = pocketMaterials[170, 0]
+pocketMaterials.Carpet = pocketMaterials[171, 0]
+pocketMaterials.HardenedClay = pocketMaterials[172, 0]
+pocketMaterials.BlockOfCoal = pocketMaterials[173, 0]
+pocketMaterials.PackedIce = pocketMaterials[174, 0]
+pocketMaterials.Sunflower = pocketMaterials[175, 0]
+pocketMaterials.DaylightSensorOn = pocketMaterials[178, 0]
+
+pocketMaterials.SpruceFenceGate = pocketMaterials[183, 0]
+pocketMaterials.BirchFenceGate = pocketMaterials[184, 0]
+pocketMaterials.JungleFenceGate = pocketMaterials[185, 0]
+pocketMaterials.DarkOakFenceGate = pocketMaterials[186, 0]
+pocketMaterials.AcaciaFenceGate = pocketMaterials[187, 0]
+pocketMaterials.GrassPath = pocketMaterials[198, 0]
+pocketMaterials.ItemFrame = pocketMaterials[199, 0]
+
+pocketMaterials.Podzol = pocketMaterials[243, 0]
+pocketMaterials.Beetroot = pocketMaterials[244, 0]
+pocketMaterials.StoneCutter = pocketMaterials[245, 0]
 pocketMaterials.GlowingObsidian = pocketMaterials[246, 0]
 pocketMaterials.NetherReactor = pocketMaterials[247, 0]
 pocketMaterials.NetherReactorUsed = pocketMaterials[247, 1]
+pocketMaterials.UpdateGameBlock1 = pocketMaterials[248, 0]
+pocketMaterials.UpdateGameBlock2 = pocketMaterials[249, 0]
+pocketMaterials.info_reserved6 = pocketMaterials[255, 0]
 
+# pocketMaterials.RedstoneRepeaterOff = alphaMaterials[93, 0] 
+# pocketMaterials.RedstoneRepeaterOn = alphaMaterials[94, 0]
 
-def printStaticDefs(name):
+def printStaticDefs(name, file_name=None):
     # printStaticDefs('alphaMaterials')
+    # file_name: file to write the output to
     mats = eval(name)
+    msg = "MCEdit static definitions for '%s'\n\n"%name
+    mats_ids = []
     for b in sorted(mats.allBlocks):
-        print "{name}.{0} = {name}[{1},{2}]".format(
+        msg += "{name}.{0} = {name}[{1},{2}]\n".format(
             b.name.replace(" ", "").replace("(", "").replace(")", ""),
             b.ID, b.blockData,
             name=name,
         )
+        if b.ID not in mats_ids:
+            mats_ids.append(b.ID)
+    print msg
+    if file_name:
+        msg += "\nNumber of materials: %s\n%s"%(len(mats_ids), mats_ids)
+        id_min = min(mats_ids)
+        id_max = max(mats_ids)
+        msg += "\n\nLowest ID: %s\nHighest ID: %s\n"%(id_min, id_max)
+        missing_ids = []
+        for i in range(id_min, id_max + 1):
+            if i not in mats_ids:
+                missing_ids.append(i)
+        if missing_ids:
+                msg += "\nIDs not in the list:\n%s\n(%s IDs)\n"%(missing_ids, len(missing_ids))
+        open(file_name, 'w').write(msg)
+        print "Written to '%s'"%file_name
 
 
 _indices = rollaxis(indices((id_limit, 16)), 0, 3)
@@ -964,10 +1232,54 @@ def convertBlocks(destMats, sourceMats, blocks, blockData):
 
 namedMaterials = dict((i.name, i) for i in allMaterials)
 
-block_map = {}
-for b in alphaMaterials:
-    if b.ID == 0:
-        b.stringID = "air"
-    block_map[b.ID] = "minecraft:"+b.stringID
+block_map = BlockstateAPI.material_map[alphaMaterials].block_map
+blockstates = BlockstateAPI.material_map[alphaMaterials].blockstates
+idToBlockstate = BlockstateAPI.material_map[alphaMaterials].idToBlockstate
+blockstateToID = BlockstateAPI.material_map[alphaMaterials].blockstateToID
+stringifyBlockstate = BlockstateAPI.material_map[alphaMaterials].stringifyBlockstate
+deStringifyBlockstate = BlockstateAPI.material_map[alphaMaterials].deStringifyBlockstate
+
+for mat in allMaterials:
+    if mat not in BlockstateAPI.material_map:
+        continue
+    for block in mat.allBlocks:
+        if block == mat.Air:
+            continue
+        setattr(block, "Blockstate", BlockstateAPI.material_map[mat].idToBlockstate(block.ID, block.blockData))
 
 __all__ = "indevMaterials, pocketMaterials, alphaMaterials, classicMaterials, namedMaterials, MCMaterials".split(", ")
+
+
+if '--dump-mats' in os.sys.argv:
+    os.sys.argv.remove('--dump-mats')
+    for n in ("indevMaterials", "pocketMaterials", "alphaMaterials", "classicMaterials"):
+        printStaticDefs(n, "%s.mats"%n.split('M')[0])
+        
+if '--find-blockstates' in os.sys.argv:
+    pe_blockstates = {'minecraft': {}}
+    passed = []
+    failed = []
+    for block in pocketMaterials:
+        ID = block.ID
+        DATA = block.blockData
+        pc_block = alphaMaterials.get((ID, DATA))
+        if pc_block and pc_block.stringID == block.stringID:
+            #print block
+            passed.append(block)
+        else:
+            failed.append(block)
+    print '{} failed block check'.format(len(failed))
+    for block in failed:
+        print '!{}!'.format(block)
+    for block in passed:
+        if block.stringID not in pe_blockstates["minecraft"]:
+            pe_blockstates["minecraft"][block.stringID] = {}
+            pe_blockstates["minecraft"][block.stringID]["id"] = block.ID
+            pe_blockstates["minecraft"][block.stringID]["properties"] = []
+        blockstate = idToBlockstate(block.ID, block.blockData)
+        state = {"<data>": block.blockData}
+        for (key, value) in blockstate[1].iteritems():
+            state[key] = value
+        pe_blockstates["minecraft"][block.stringID]['properties'].append(state)
+    #with open('pe_blockstates_test.json', 'wb') as out:
+    #    json.dump(pe_blockstates, out, indent=4, separators=(',', ': '))

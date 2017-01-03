@@ -15,7 +15,7 @@ import OpenGL
 import sys
 import os
 
-if "-debug" not in sys.argv:
+if "--debug-ogl" not in sys.argv:
     OpenGL.ERROR_CHECKING = False
 
 import logging
@@ -67,8 +67,49 @@ ch.setFormatter(fmt)
 
 logger.addHandler(fh)
 logger.addHandler(ch)
+import release
+start_msg = 'Starting MCEdit-Unified v%s'%release.TAG
+logger.info(start_msg)
+print '[ ****** ] ~~~~~~~~~~ %s'%start_msg
 
-import version_utils
+#---------------------------------------------------------------------
+# NEW FEATURES HANDLING
+#
+# The idea is to be able to implement and test/use new code without stripping off the current one.
+# These features/new code will be in the released stuff, but unavailable until explicitly requested.
+#
+# The new features which are under development can be enabled using the 'new_features.def' file.
+# This file is a plain text file with one feature to enable a line.
+# The file is parsed and each feature is added to the builtins using the pattern 'mcenf_<feature>'.
+# The value for these builtins is 'True'.
+# Then, in the code, just check if the builtins has the key 'mcenf_<feature>' to use the new version of the code: 
+#
+# ```
+# def foo_old():
+#     # Was 'foo', code here is the one used unless the new version is wanted.
+#     [...]
+#
+# def foo_new():
+#     # This is the new version of the former 'foo' (current 'foo_old').
+#     [...]
+#
+# if __builtins__.get('mcenf_foo', False):
+#     foo = foo_new
+# else:
+#     foo = foo_old
+#
+# ```
+#
+if '--new-features' in sys.argv:
+    if not os.path.exists('new_features.def'):
+        logger.warn("New features requested, but file 'new_features.def' not found!")
+    else:
+        lines = [a.strip() for a in open('new_features.def', 'r').readlines()]
+        for line in lines:
+            setattr(__builtins__, 'mcenf_%s'%line, True)
+
+
+from version_utils import PlayerCache
 import directories
 import keys
 
@@ -121,13 +162,19 @@ if "-tt" in sys.argv:
 import mceutils
 import mcplatform
 
-# This switch is used to test/debug window handling.
-# Must be specified to enable the internal handler for Windows.
+# The two next switches '--debug-wm' and '--no-wm' are used to debug/disable the internal window handler.
+# They are exclusive. You can't debug if it is disabled.
 if "--debug-wm" in sys.argv:
     mcplatform.DEBUG_WM = True
+if "--no-wm" in sys.argv:
+    mcplatform.DEBUG_WM = False
+    mcplatform.USE_WM = False
+else:
     mcplatform.setupWindowHandler()
 
 DEBUG_WM = mcplatform.DEBUG_WM
+USE_WM = mcplatform.USE_WM
+
 
 #-# DEBUG
 if mcplatform.hasXlibDisplay and DEBUG_WM:
@@ -147,7 +194,7 @@ import os.path
 import pygame
 from pygame import display, rect
 import pymclevel
-import release
+# import release
 import shutil
 import sys
 import traceback
@@ -246,6 +293,8 @@ class MCEdit(GLViewport):
                 lng = "en_US"
                 config.settings.langCode.set(lng)
             albow.translate.setLang(lng)
+        # Set the window caption here again, since the initialization is done through several steps...
+        display.set_caption(('MCEdit ~ ' + release.get_version()%_("for")).encode('utf-8'), 'MCEdit')
         self.optionsPanel.initComponents()
         self.graphicsPanel = panels.GraphicsPanel(self)
 
@@ -384,7 +433,7 @@ class MCEdit(GLViewport):
             platform_open(os.path.join(directories.getDataDir(), "LICENSE.txt"))
             
         def refresh():
-            version_utils.playercache.force_refresh()
+            PlayerCache().force_refresh()
 
         hotkeys = ([("",
                      "Controls",
@@ -456,10 +505,12 @@ class MCEdit(GLViewport):
         config_w, config_h = config.settings.windowWidth.get(), config.settings.windowHeight.get()
         win = self.displayContext.win
 
-        if DEBUG_WM:
+        if DEBUG_WM and win:
             print "dw", dw, "dh", dh
             print "self.size (w, h) 1", self.size, "win.get_size", win.get_size()
             print "size 1", config_w, config_h
+        elif DEBUG_WM and not win:
+            print "win is None, unable to print debug messages"
 
         if win:
             x, y =  win.get_position()
@@ -472,7 +523,14 @@ class MCEdit(GLViewport):
             self.editor.renderer.render = False
             return
 
-        if win:
+        # Mac window handling works better now, but `win`
+        # doesn't exist. So to get this alert to show up
+        # I'm checking if the platform is darwin. This only
+        # works because the code block never actually references
+        # `win`, otherwise it WOULD CRASH!!!
+        # You cannot change further if statements like this
+        # because they reference `win`
+        if win or sys.platform == "darwin":
             # Handling too small resolutions.
             # Dialog texts.
             # "MCEdit does not support window resolutions below 1000x700.\nYou may not be able to access all functions at this resolution."
@@ -708,7 +766,8 @@ class MCEdit(GLViewport):
 
     @classmethod
     def main(cls):
-        displayContext = GLDisplayContext(splash.splash, caption=('MCEdit ~ ' + release.get_version()%_("for"), 'MCEdit'))
+        PlayerCache().load()
+        displayContext = GLDisplayContext(splash.splash, caption=(('MCEdit ~ ' + release.get_version()%_("for")).encode('utf-8'), 'MCEdit'))
 
         os.environ['SDL_VIDEO_CENTERED'] = '0'
 
@@ -832,10 +891,10 @@ class MCEdit(GLViewport):
                 exc_txt = traceback.format_exc()
                 if mcedit.editor.level:
                     if config.settings.savePositionOnClose.get():
-                        mcedit.editor.waypointManager.saveLastPosition(mcedit.editor.mainViewport, mcedit.editor.level.getPlayerDimension())
+                        mcedit.editor.waypointManager.saveLastPosition(mcedit.editor.mainViewport, mcedit.editor.level.dimNo)
                     mcedit.editor.waypointManager.save()
                 # The following Windows specific code won't be executed if we're using '--debug-wm' switch.
-                if not DEBUG_WM and sys.platform == "win32" and config.settings.setWindowPlacement.get():
+                if not USE_WM and sys.platform == "win32" and config.settings.setWindowPlacement.get():
                     (flags, showCmd, ptMin, ptMax, rect) = mcplatform.win32gui.GetWindowPlacement(
                         display.get_wm_info()['window'])
                     X, Y, r, b = rect
@@ -877,7 +936,7 @@ class MCEdit(GLViewport):
             print "############################ EXITING ############################"
         win = self.displayContext.win
         # The following Windows specific code will not be executed if we're using '--debug-wm' switch.
-        if not DEBUG_WM and sys.platform == "win32" and config.settings.setWindowPlacement.get():
+        if not USE_WM and sys.platform == "win32" and config.settings.setWindowPlacement.get():
             (flags, showCmd, ptMin, ptMax, rect) = mcplatform.win32gui.GetWindowPlacement(
                 display.get_wm_info()['window'])
             X, Y, r, b = rect
